@@ -41,13 +41,6 @@ Add `--scope project` to install into a single project (writes to
 An omp build whose extension API provides `ctx.ui.custom()` and
 `pi.getActiveTools()` / `pi.setActiveTools()`. Verified against **omp 17.3.5**.
 
-### If you already have a copy in `~/.omp/agent/extensions/`
-
-Delete it before installing. omp de-duplicates extensions by resolved absolute
-path and skips a slash command whose name is already registered, so keeping both
-copies means one registration is dropped with only a diagnostic in `~/.omp/logs/`
-to show for it.
-
 ## Manage
 
 ```bash
