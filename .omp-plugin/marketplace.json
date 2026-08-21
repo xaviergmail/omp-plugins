@@ -1,0 +1,29 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "omp-plugins",
+  "owner": {
+    "name": "Xavier Bergeron",
+    "email": "xbergeron@xoi.io"
+  },
+  "metadata": {
+    "description": "Personal oh-my-pi plugins",
+    "version": "1.0.0",
+    "pluginRoot": "plugins"
+  },
+  "plugins": [
+    {
+      "name": "mcps",
+      "source": "./mcps",
+      "version": "1.0.0",
+      "description": "/mcps — turn MCP servers on and off for the current session only",
+      "category": "productivity",
+      "keywords": ["mcp", "tools", "context"],
+      "author": {
+        "name": "Xavier Bergeron",
+        "email": "xbergeron@xoi.io"
+      },
+      "repository": "https://github.com/xaviergmail/omp-plugins",
+      "license": "MIT"
+    }
+  ]
+}
