@@ -1,12 +1,12 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "omp-plugins",
+  "name": "xaviergmail-omp-plugins",
   "owner": {
     "name": "Xavier Bergeron",
     "email": "xbergeron@xoi.io"
   },
   "metadata": {
-    "description": "Personal oh-my-pi plugins",
+    "description": "oh-my-pi plugins by @xaviergmail",
     "version": "1.0.0",
     "pluginRoot": "plugins"
   },
