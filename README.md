@@ -9,7 +9,7 @@ each plugin is a directory under [`plugins/`](plugins).
 
 | Plugin | Command | What it does |
 | --- | --- | --- |
-| [`mcps`](plugins/mcps) | `/mcps` | Turn MCP servers on and off for the current session only |
+| [`mcps`](plugins/mcps) | `/mcps` | Turn MCP servers on and off for the current session only, including ones config disables |
 
 ## Install
 
@@ -39,7 +39,9 @@ Add `--scope project` to install into a single project (writes to
 ### Requirements
 
 An omp build whose extension API provides `ctx.ui.custom()` and
-`pi.getActiveTools()` / `pi.setActiveTools()`. Verified against **omp 17.3.5**.
+`pi.getActiveTools()` / `pi.setActiveTools()`, and whose bundled
+`@oh-my-pi/pi-coding-agent/mcp` exposes `MCPManager.instance()` with
+`connectServers()` / `waitForStartup()`. Verified against **omp 18.4.3**.
 
 ## Manage
 
