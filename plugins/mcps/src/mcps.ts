@@ -1,6 +1,9 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { clearCache as clearDiscoveryFileCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp";
 import {
   type Component,
   Key,
@@ -15,12 +18,19 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 //
 // Why tool activation and not config: turning a server "off" for the current
 // session must not touch `mcp.json` (that is `/mcp disable`, and it persists).
-// The only session-scoped lever the extension API exposes is the active tool set:
+// The session-scoped lever for a running server is the active tool set:
 // `pi.getActiveTools()` returns `session.getEnabledToolNames()` — top-level tools
 // plus everything mounted under `xd://` — and `pi.setActiveTools(names)` replaces
 // that whole set. Dropping a server's `mcp__<server>_*` names removes them from the
 // model's contract and from the `xd://` device catalog while leaving the MCP
 // connection alone, so re-enabling is instant and needs no reconnect.
+//
+// A server disabled in config (`enabled: false` or `disabledServers`) has no
+// connection and no tools to activate, so switching it on goes through the
+// session's own `MCPManager` instead: host discovery supplies the definition,
+// the manager connects it and hands its tools to the session exactly as it does
+// at startup, and switching it off disconnects it again. Still nothing is written
+// to `mcp.json`.
 //
 // Every apply passes the FULL desired name list, never an incremental diff, so a
 // stale snapshot can never silently demote unrelated tools.
@@ -30,9 +40,18 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 // and its two-line option rendering (label + description) shifts the list layout as
 // the cursor moves. A `Component` under `ctx.ui.custom()` owns both.
 
-const DISABLED_ENTRY_TYPE = "io.xoi.mcps.disabled-servers";
+/**
+ * Custom session entry holding this session's switches. The type string predates
+ * the `connected` field and stays as is so sessions saved by 1.0.x still restore.
+ */
+const STATE_ENTRY_TYPE = "io.xoi.mcps.disabled-servers";
 const MCP_PREFIX = "mcp__";
 const MAX_VISIBLE_ROWS = 18;
+/**
+ * Cap on waiting for the session to register a newly connected server's tools:
+ * `waitForStartup` also waits on unrelated servers that are still starting.
+ */
+const TOOL_REFRESH_DRAIN_MS = 5_000;
 
 // ---------------------------------------------------------------------------
 // Minimal structural types. `@oh-my-pi/pi-coding-agent` is not resolvable outside
@@ -79,16 +98,57 @@ interface CtxLike {
   mode?: string;
   cwd: string;
   ui: UiLike;
+  /** The agent this session runs: `kind` is `"main"` for the top-level session, `"sub"` for any spawned one. */
+  agent?: { kind?: string };
   sessionManager: {
     getBranch(): Iterable<{ type?: string; customType?: string; data?: unknown }>;
   };
+}
+
+/** Connect-time server config (`MCPServerConfig`, `mcp/types.ts`). */
+type ConnectConfig = Record<string, unknown>;
+
+/** The slice of the session's `MCPManager` used to run config-off servers. */
+interface McpManagerLike {
+  getAllServerNames(): string[];
+  getConnectionStatus(name: string): "connected" | "connecting" | "disconnected";
+  connectServers(
+    configs: Record<string, ConnectConfig>,
+    sources: Record<string, unknown>,
+    onStatus: undefined,
+    startupTimeoutMs: number,
+  ): Promise<{ errors: Map<string, string> }>;
+  waitForStartup(timeoutMs: number): Promise<unknown>;
+  disconnectServer(name: string): Promise<void>;
+}
+
+/** Canonical server record from host discovery (`MCPServer`, `capability/mcp.ts`). */
+interface DiscoveredServer {
+  name: string;
+  transport?: "stdio" | "sse" | "http";
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  envPolicy?: string;
+  envLiteralKeys?: string[];
+  cwd?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  headerPolicy?: string;
+  timeout?: number;
+  requestIdFormat?: string;
+  instructions?: boolean;
+  auth?: unknown;
+  oauth?: unknown;
+  _source: unknown;
 }
 
 /** How a configured server presents in the session right now. */
 type ServerState =
   | "on" // has tools, active
   | "off" // has tools, switched off in this session
-  | "config-off" // suppressed by config (`enabled: false` or `disabledServers`)
+  | "session-on" // disabled in config, switched on (connected) for this session
+  | "config-off" // suppressed by config (`enabled: false` or `disabledServers`), not connected
   | "not-running"; // enabled in config but contributed no tools
 
 interface ServerRow {
@@ -96,6 +156,8 @@ interface ServerRow {
   /** Registered `mcp__…` tool names owned by this server; empty when it never connected. */
   tools: string[];
   state: ServerState;
+  /** Suppressed by config: switching it on connects it for this session, switching it off disconnects it. */
+  configOff: boolean;
   /** Best-effort failure text recovered from the session log. */
   error?: string;
 }
@@ -136,19 +198,26 @@ function sanitizePart(value: string): string {
     .replace(/^_+|_+$/g, "");
 }
 
-/** Config scan is stable for a session; the per-turn reconcile must not re-read files. */
+/** The string members of a JSON array value; anything else is empty. */
+function stringSet(value: unknown): Set<string> {
+  return new Set(Array.isArray(value) ? value.filter((n): n is string => typeof n === "string") : []);
+}
+
+/** Cached for the per-turn reconcile, which must not re-read files; `/mcps` rescans on open. */
 const configCache = new Map<string, McpConfig>();
 
 /**
  * Read the MCP configuration OMP discovers, in its precedence order.
  *
- * Two reasons the extension must parse these files itself rather than ask the
+ * Two reasons the extension parses these files itself rather than ask the
  * runtime. First, `getAllTools()` reports MCP tools with a synthetic `sourceInfo`
  * (`{ source: "mcp", path: "<mcp:name>" }`) carrying no server identity, and
  * `mcp__<server>_<tool>` does not split unambiguously — `mcp__chrome_devtools_list`
  * could be `chrome`/`devtools_list` or `chrome-devtools`/`list`. Second, a server
  * suppressed by `enabled: false` or `disabledServers` never reaches the MCP manager
- * at all, so it is invisible at every API level; listing it requires the raw file.
+ * at all, so no live runtime state lists it. The scan is synchronous and cheap
+ * enough to back the per-turn reconcile; connecting a config-off server needs its
+ * full definition, which comes from host discovery instead (`discoverDefinitions`).
  */
 function readMcpConfig(cwd: string): McpConfig {
   const cached = configCache.get(cwd);
@@ -199,13 +268,11 @@ function readMcpConfig(cwd: string): McpConfig {
     }
   }
 
-  const names = (value: unknown): Set<string> =>
-    new Set(Array.isArray(value) ? value.filter((n): n is string => typeof n === "string") : []);
   const user = readJson(userPath);
   const config: McpConfig = {
     entries,
-    denied: names(user?.disabledServers),
-    forced: names(user?.enabledServers),
+    denied: stringSet(user?.disabledServers),
+    forced: stringSet(user?.enabledServers),
   };
   configCache.set(cwd, config);
   return config;
@@ -215,6 +282,57 @@ function readMcpConfig(cwd: string): McpConfig {
 function configEnabled(config: McpConfig, name: string): boolean {
   if (config.denied.has(name)) return false;
   return config.entries.get(name)?.enabled !== false || config.forced.has(name);
+}
+
+/**
+ * Every server definition host discovery finds, by name, config-off ones
+ * included. `loadAllMCPConfigs` drops those through its `suppress` hook, so this
+ * calls the capability loader underneath it without one. `all` is in precedence
+ * order, so the first record per name is the one that owns the name.
+ */
+async function discoverDefinitions(cwd: string): Promise<Map<string, DiscoveredServer>> {
+  // Discovery caches file reads for the whole process; drop them so an edit made
+  // since startup is seen, as the modal's own rescan sees it (`/mcp reload` does the same).
+  clearDiscoveryFileCache();
+  const result = (await loadCapability("mcps", { cwd })) as unknown as { all: DiscoveredServer[] };
+  const byName = new Map<string, DiscoveredServer>();
+  for (const server of result.all) if (!byName.has(server.name)) byName.set(server.name, server);
+  return byName;
+}
+
+/**
+ * A discovery record as a connect config. Mirrors the host's private
+ * `convertToLegacyConfig` (`mcp/config.ts`) except that `enabled` is left out:
+ * the server is being switched on.
+ */
+function toConnectConfig(server: DiscoveredServer): ConnectConfig {
+  const type = server.transport ?? (server.command ? "stdio" : server.url ? "http" : "stdio");
+  const config: ConnectConfig = {
+    type,
+    timeout: server.timeout,
+    requestIdFormat: server.requestIdFormat,
+    instructions: server.instructions,
+    auth: server.auth,
+    oauth: server.oauth,
+  };
+  if (type === "stdio") {
+    config.command = server.command ?? "";
+    if (server.args) config.args = server.args;
+    if (server.env) config.env = server.env;
+    if (server.envPolicy) config.envPolicy = server.envPolicy;
+    if (server.envLiteralKeys) config.envLiteralKeys = server.envLiteralKeys;
+    if (server.cwd) config.cwd = server.cwd;
+  } else {
+    config.url = server.url ?? "";
+    if (server.headers) config.headers = server.headers;
+    if (server.headerPolicy) config.headerPolicy = server.headerPolicy;
+  }
+  return config;
+}
+
+/** The top-level session's MCP manager (subagents share it); absent when MCP is off. */
+function mcpManager(): McpManagerLike | undefined {
+  return MCPManager.instance() as unknown as McpManagerLike | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +449,7 @@ function buildRows(
   allTools: ToolInfoLike[],
   config: McpConfig,
   sessionDisabled: ReadonlySet<string>,
+  sessionConnected: ReadonlySet<string>,
   errors: Map<string, string>,
 ): ServerRow[] {
   const groups = groupToolsByServer(allTools, config);
@@ -338,18 +457,26 @@ function buildRows(
   const rows: ServerRow[] = [];
   for (const name of names) {
     const tools = groups.get(name) ?? [];
+    const configOff = !configEnabled(config, name);
+    // A config-off server switched on this session counts as running before its tools land.
+    const running = tools.length > 0 || (configOff && sessionConnected.has(name));
     let state: ServerState;
-    if (tools.length > 0) state = sessionDisabled.has(name) ? "off" : "on";
-    else if (!configEnabled(config, name)) state = "config-off";
-    else state = "not-running";
-    rows.push({ name, tools, state, error: state === "not-running" ? errors.get(name) : undefined });
+    if (!running) state = configOff ? "config-off" : "not-running";
+    else if (sessionDisabled.has(name)) state = "off";
+    else state = configOff ? "session-on" : "on";
+    rows.push({ name, tools, state, configOff, error: state === "not-running" ? errors.get(name) : undefined });
   }
   return rows.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** Only a server with registered tools can be switched: the rest have nothing to remove. */
-function isToggleable(row: ServerRow): boolean {
-  return row.tools.length > 0;
+/**
+ * A running server switches through its tool set, a config-off one through a
+ * connect, which needs the session's MCP manager. An enabled server that is not
+ * running has nothing to switch, and an extension cannot repair its connect.
+ */
+function isToggleable(row: ServerRow, canConnect: boolean): boolean {
+  if (row.state === "config-off") return canConnect;
+  return row.state !== "not-running";
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +493,19 @@ const ACTIONS: { id: ActionId; label: string }[] = [
 ];
 
 interface ModalResult {
-  disabled: string[];
+  /** Every server left switched off, config-off ones included. */
+  off: string[];
+}
+
+/** What one `/mcps` apply changed, for the confirmation line. */
+interface ApplyReport {
+  off: [string, number][];
+  on: [string, number][];
+  /** `on` servers came back as top-level tools (see `summarize`). */
+  pinned: boolean;
+  connected: [string, number][];
+  disconnected: string[];
+  failed: [string, string][];
 }
 
 /** Pad or truncate a possibly ANSI-styled string to exactly `width` columns. */
@@ -390,6 +529,8 @@ function fit(text: string, width: number): string {
 class McpModal implements Component {
   focused = false;
   #rows: ServerRow[];
+  #canConnect: boolean;
+  /** Names drafted off: switched off this session, or disabled in config and not connected. */
   #draft: Set<string>;
   #done: (result: ModalResult | undefined) => void;
   #theme: ThemeLike;
@@ -399,9 +540,16 @@ class McpModal implements Component {
   #total: number;
   #nameWidth: number;
 
-  constructor(rows: ServerRow[], disabled: ReadonlySet<string>, theme: ThemeLike, done: (r: ModalResult | undefined) => void) {
+  constructor(
+    rows: ServerRow[],
+    disabled: ReadonlySet<string>,
+    canConnect: boolean,
+    theme: ThemeLike,
+    done: (r: ModalResult | undefined) => void,
+  ) {
     this.#rows = rows;
-    this.#draft = new Set(disabled);
+    this.#canConnect = canConnect;
+    this.#draft = new Set([...disabled, ...rows.filter(r => r.state === "config-off").map(r => r.name)]);
     this.#theme = theme;
     this.#done = done;
     this.#total = rows.length + ACTIONS.length;
@@ -470,10 +618,12 @@ class McpModal implements Component {
 
   #footer(): string {
     const row = this.#rows[this.#index];
-    if (row && !isToggleable(row)) {
-      return row.state === "config-off"
-        ? "disabled in the config file — use /mcp enable, then restart"
-        : "no tools registered — nothing to switch this session";
+    if (row?.state === "not-running") return "no tools registered — nothing to switch this session";
+    if (row?.configOff) {
+      if (!isToggleable(row, this.#canConnect)) return "disabled in config — this session has no MCP manager to connect it";
+      return this.#draft.has(row.name)
+        ? "disabled in config — switch on to connect it for this session only"
+        : "on for this session only — switch off to disconnect it";
     }
     return "space/enter toggle · ↑↓ move · esc cancel";
   }
@@ -490,18 +640,24 @@ class McpModal implements Component {
 
     const row = this.#rows[i]!;
     const off = this.#draft.has(row.name);
-    const toggleable = isToggleable(row);
+    const toggleable = isToggleable(row, this.#canConnect);
     const marker = toggleable ? (off ? t.fg("dim", "☐") : t.fg("accent", "☑")) : t.fg("dim", "⚠");
     const name = fit(toggleable && !off ? t.fg("text", row.name) : t.fg("dim", row.name), this.#nameWidth);
 
     // Status lives on THIS line at a fixed column, so cursor movement never
     // changes any row's height and the list cannot shift under the cursor.
-    let status: string;
-    if (!toggleable && row.state === "config-off") status = "disabled in config";
-    else if (!toggleable) status = row.error ? `enabled, not running — ${row.error}` : "enabled, not running";
-    else status = `${off ? "disabled" : "enabled"} · ${row.tools.length} tool${row.tools.length === 1 ? "" : "s"}`;
+    return `${cursor}${marker} ${name}  ${t.fg("dim", this.#status(row, off))}`;
+  }
 
-    return `${cursor}${marker} ${name}  ${t.fg("dim", status)}`;
+  /** Status for the drafted state; config-off rows also say what Apply will do to the connection. */
+  #status(row: ServerRow, off: boolean): string {
+    if (row.state === "not-running") return row.error ? `enabled, not running — ${row.error}` : "enabled, not running";
+    const count = row.tools.length;
+    const tools = count > 0 ? `${count} tool${count === 1 ? "" : "s"}` : "no tools yet";
+    if (!row.configOff) return `${off ? "disabled" : "enabled"} · ${tools}`;
+    const running = row.state !== "config-off";
+    if (off) return running ? "disabled in config · disconnects on apply" : "disabled in config";
+    return running ? `enabled this session · ${tools}` : "enabled this session · connects on apply";
   }
 
   #move(delta: number): void {
@@ -512,20 +668,22 @@ class McpModal implements Component {
     const action = ACTIONS[this.#index - this.#rows.length];
     if (!action) {
       const row = this.#rows[this.#index];
-      if (!row || !isToggleable(row)) return; // informational row
+      if (!row || !isToggleable(row, this.#canConnect)) return; // informational row
       if (this.#draft.has(row.name)) this.#draft.delete(row.name);
       else this.#draft.add(row.name);
       return;
     }
     switch (action.id) {
       case "apply":
-        this.#done({ disabled: [...this.#draft] });
+        this.#done({ off: [...this.#draft] });
         return;
       case "all-on":
         this.#draft.clear();
+        // Without a manager a config-off server cannot come up, so it stays drafted off.
+        if (!this.#canConnect) for (const row of this.#rows) if (row.state === "config-off") this.#draft.add(row.name);
         return;
       case "all-off":
-        for (const row of this.#rows) if (isToggleable(row)) this.#draft.add(row.name);
+        for (const row of this.#rows) if (isToggleable(row, this.#canConnect)) this.#draft.add(row.name);
         return;
       case "cancel":
         this.#done(undefined);
@@ -542,43 +700,65 @@ export default function mcps(pi: ExtensionAPI): void {
   /** Servers the user switched off in this session. */
   const disabled = new Set<string>();
   /**
+   * Config-off servers the user switched on in this session. Only servers this
+   * extension connected (or adopted from the modal), so restoring a branch tears
+   * down nothing else: a subagent shares its parent's manager.
+   */
+  const connected = new Set<string>();
+  /** Connects in flight, so a turn never starts a second one for the same server. */
+  const connecting = new Set<string>();
+  /**
    * Exact tool names removed per server, so re-enabling restores only what this
    * extension took away — never a tool some other feature (`/tools`, `--tools`,
    * plan mode) deliberately left inactive.
    */
   const removed = new Map<string, Set<string>>();
+  /**
+   * `apply` reads the active set and writes it back after an await; two
+   * interleaved runs could undo each other's restorations, so they queue.
+   */
+  let applying: Promise<unknown> = Promise.resolve();
+  const serialized = <T>(task: () => Promise<T>): Promise<T> => {
+    const run = applying.then(task);
+    applying = run.catch(() => undefined);
+    return run;
+  };
 
   const toolGroups = (ctx: CtxLike): Map<string, string[]> =>
     groupToolsByServer(pi.getAllTools() as unknown as ToolInfoLike[], readMcpConfig(ctx.cwd));
 
   const persist = (): void => {
-    pi.appendEntry(DISABLED_ENTRY_TYPE, { servers: [...disabled] });
+    pi.appendEntry(STATE_ENTRY_TYPE, { servers: [...disabled], connected: [...connected] });
   };
 
-  /** Rebuild `disabled` from the session branch (resume / branch / tree navigation). */
-  const restoreState = (ctx: CtxLike): void => {
-    let latest: string[] | undefined;
+  /** Latest switches persisted on the current branch; `servers` holds the switched-off ones. */
+  const readState = (ctx: CtxLike): { disabled: Set<string>; connected: Set<string> } => {
+    let data: unknown;
     for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type !== "custom" || entry.customType !== DISABLED_ENTRY_TYPE) continue;
-      const data = entry.data;
-      const servers = data && typeof data === "object" && "servers" in data ? data.servers : undefined;
-      if (Array.isArray(servers)) latest = servers.filter((s): s is string => typeof s === "string");
+      if (entry.type === "custom" && entry.customType === STATE_ENTRY_TYPE) data = entry.data;
     }
-    disabled.clear();
-    for (const name of latest ?? []) disabled.add(name);
+    const record = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+    return { disabled: stringSet(record.servers), connected: stringSet(record.connected) };
   };
 
   /**
    * Bring the active tool set in line with `nextDisabled` and adopt it as the new
    * state. Always hands `setActiveTools` the complete desired name list.
+   *
+   * `gone` holds the tools of servers just disconnected. Each disconnect queued a
+   * session tool refresh that re-enables every MCP tool, switched-off servers'
+   * included, and this snapshot may predate it. So the list is written back
+   * whenever `gone` is non-empty: writes queue behind that refresh, which keeps
+   * the switched-off servers off once it lands.
    */
   const apply = async (
     ctx: CtxLike,
     nextDisabled: ReadonlySet<string>,
-  ): Promise<{ off: [string, number][]; on: [string, number][] }> => {
+    gone: ReadonlySet<string> = new Set(),
+  ): Promise<{ off: [string, number][]; on: [string, number][]; pinned: boolean }> => {
     const enabled = pi.getActiveTools();
     const enabledSet = new Set(enabled);
-    const drop = new Set<string>();
+    const drop = new Set<string>(gone);
     const restore: string[] = [];
     const off: [string, number][] = [];
     const on: [string, number][] = [];
@@ -591,16 +771,18 @@ export default function mcps(pi: ExtensionAPI): void {
         const record = removed.get(name) ?? new Set<string>();
         for (const tool of taken) record.add(tool);
         removed.set(name, record);
-        off.push([name, taken.length]);
+        // Re-dropping tools a refresh brought back is upkeep, not a change to report.
+        if (!disabled.has(name)) off.push([name, taken.length]);
       } else {
         const record = removed.get(name);
         if (!record) continue;
-        // Only names this extension removed, that still exist and are not active.
-        const back = tools.filter(tool => record.has(tool) && !enabledSet.has(tool));
         removed.delete(name);
-        if (back.length === 0) continue;
+        // Only names this extension removed, that still exist and are not active.
+        const back = tools.filter(tool => record.has(tool) && !enabledSet.has(tool) && !gone.has(tool));
         restore.push(...back);
-        on.push([name, back.length]);
+        // A tools refresh (after a connect or disconnect) may have re-enabled them already.
+        const count = back.length + tools.filter(tool => enabledSet.has(tool)).length;
+        if (count > 0) on.push([name, count]);
       }
     }
 
@@ -611,7 +793,8 @@ export default function mcps(pi: ExtensionAPI): void {
 
     disabled.clear();
     for (const name of nextDisabled) disabled.add(name);
-    return { off, on };
+    // Restored names land pinned top-level unless a queued tools refresh remounted them first.
+    return { off, on, pinned: restore.length > 0 && gone.size === 0 };
   };
 
   /**
@@ -633,48 +816,175 @@ export default function mcps(pi: ExtensionAPI): void {
   };
 
   /**
+   * Connect config-off servers through the session's MCP manager, then wait until
+   * every handshake has settled and the session has registered the new tools.
+   * Returns the failure text of each server that did not come up.
+   */
+  const connectNow = async (cwd: string, names: readonly string[]): Promise<Map<string, string>> => {
+    const failed = new Map<string, string>();
+    if (names.length === 0) return failed;
+    const manager = mcpManager();
+    if (!manager) {
+      for (const name of names) failed.set(name, "no MCP manager in this session");
+      return failed;
+    }
+    const definitions = await discoverDefinitions(cwd);
+    const configs: Record<string, ConnectConfig> = {};
+    const sources: Record<string, unknown> = {};
+    for (const name of names) {
+      const server = definitions.get(name);
+      if (!server) {
+        failed.set(name, "MCP discovery found no definition");
+        continue;
+      }
+      configs[name] = toConnectConfig(server);
+      sources[name] = server._source;
+    }
+    const starting = Object.keys(configs);
+    if (starting.length === 0) return failed;
+    for (const name of starting) connecting.add(name);
+    try {
+      // 0 waits for each handshake to settle rather than racing the 250 ms startup window, so the result is final.
+      const { errors } = await manager.connectServers(configs, sources, undefined, 0);
+      for (const [name, error] of errors) failed.set(name, summarizeError(error));
+      // New tools reach the session through the manager's tools-changed callback,
+      // which `waitForStartup` drains; only then does the active set list them.
+      await manager.waitForStartup(TOOL_REFRESH_DRAIN_MS);
+    } finally {
+      for (const name of starting) connecting.delete(name);
+    }
+    return failed;
+  };
+
+  /**
+   * Restore or reconnect in the background: a server can take seconds to start,
+   * and neither session start nor a turn should wait on it. Its tools land through
+   * the manager like any slow server's, and the switched-off set is re-asserted after.
+   */
+  const connectLater = (ctx: CtxLike, names: string[]): void => {
+    void (async () => {
+      const failed = await connectNow(ctx.cwd, names);
+      const lost: string[] = [];
+      for (const [name, error] of failed) {
+        // A server switched off meanwhile had its connect cancelled on purpose.
+        if (connected.delete(name)) lost.push(`${name} — ${error}`);
+      }
+      if (lost.length > 0) {
+        persist();
+        ctx.ui.notify(`MCP could not reconnect ${lost.join(", ")}; switched off for this session`, "warning");
+      }
+      await serialized(() => apply(ctx, new Set(disabled)));
+    })().catch(error => {
+      ctx.ui.notify(`/mcps: ${error instanceof Error ? error.message : String(error)}`, "error");
+    });
+  };
+
+  /** Tear down a config-off server this session switched on; config stays the authority after. */
+  const disconnect = async (name: string): Promise<void> => {
+    connected.delete(name);
+    removed.delete(name);
+    await mcpManager()?.disconnectServer(name);
+  };
+
+  /**
+   * Re-apply the current branch's switches on session start (resume), session
+   * switch (`/new`, `/resume`, fork), branch, and tree navigation. Disconnects run
+   * inline; connects run in the background so neither startup nor navigation
+   * waits on a server.
+   *
+   * Subagents skip this, and without loaded state every other path is a no-op for
+   * them. They share the top-level session's MCP manager, and a `/tan` clone's
+   * session is a fork of the parent's: revived, it would replay the parent's
+   * switches as of the fork on that shared manager and reconnect a server the
+   * parent has since switched off.
+   */
+  const restore = async (ctx: CtxLike): Promise<void> => {
+    if (ctx.agent?.kind === "sub") return;
+    const state = readState(ctx);
+    const groups = toolGroups(ctx);
+    const gone = new Set<string>();
+    for (const name of [...connected]) {
+      if (state.connected.has(name)) continue;
+      for (const tool of groups.get(name) ?? []) gone.add(tool);
+      await disconnect(name);
+    }
+    for (const name of state.connected) connected.add(name);
+    await serialized(() => apply(ctx, state.disabled, gone));
+    const manager = mcpManager();
+    const missing = [...connected].filter(
+      name => !connecting.has(name) && manager?.getConnectionStatus(name) === "disconnected",
+    );
+    if (missing.length > 0) connectLater(ctx, missing);
+  };
+
+  /**
+   * `/mcp reload` and `/reload-plugins` reconnect the manager from config alone,
+   * which forgets every server this session switched on; bring those back. A
+   * server the manager still knows (connected, retrying, or failed) is its to handle.
+   */
+  const reconnectDropped = (ctx: CtxLike): void => {
+    const manager = mcpManager();
+    if (!manager || connected.size === 0) return;
+    const known = new Set(manager.getAllServerNames());
+    const dropped = [...connected].filter(name => !known.has(name) && !connecting.has(name));
+    if (dropped.length > 0) connectLater(ctx, dropped);
+  };
+
+  /**
    * `setActiveToolsByName` pins every requested name that is not already in the
    * live `xd://` mount set, and the extension API exposes no way to hand it a
    * target mount partition (`setActiveToolPresentation` is session-internal). So a
-   * re-enabled server comes back as top-level tools — full schemas in the request
-   * rather than one catalog line each — until the next session start remounts it.
-   * Say so rather than let the prompt silently grow.
+   * server switched back on by this extension's own write comes back as top-level
+   * tools — full schemas in the request rather than one catalog line each — until
+   * the next session start remounts it. Say so rather than let the prompt silently
+   * grow. When a connect or disconnect in the same apply queued a tools refresh,
+   * that refresh re-enables and remounts them first, so there is nothing to say.
    */
-  const summarize = (result: { off: [string, number][]; on: [string, number][] }): string => {
+  const summarize = (report: ApplyReport): string => {
     const parts: string[] = [];
     const fmt = ([name, count]: [string, number]) => `${name} (${count})`;
-    if (result.off.length > 0) parts.push(`off: ${result.off.map(fmt).join(", ")}`);
-    if (result.on.length > 0) {
-      parts.push(`on: ${result.on.map(fmt).join(", ")} — listed top-level until next session start`);
+    if (report.connected.length > 0) parts.push(`connected for this session: ${report.connected.map(fmt).join(", ")}`);
+    if (report.disconnected.length > 0) parts.push(`disconnected: ${report.disconnected.join(", ")}`);
+    if (report.off.length > 0) parts.push(`off: ${report.off.map(fmt).join(", ")}`);
+    if (report.on.length > 0) {
+      const caveat = report.pinned ? " — listed top-level until next session start" : "";
+      parts.push(`on: ${report.on.map(fmt).join(", ")}${caveat}`);
+    }
+    if (report.failed.length > 0) {
+      parts.push(`failed: ${report.failed.map(([name, error]) => `${name} — ${error}`).join(", ")}`);
     }
     return parts.length > 0 ? `MCP ${parts.join(" · ")}` : "MCP servers unchanged";
   };
 
   pi.on("session_start", async (_event, ctx) => {
-    restoreState(ctx as unknown as CtxLike);
-    await reconcile(ctx as unknown as CtxLike);
+    await restore(ctx as unknown as CtxLike);
+  });
+  pi.on("session_switch", async (_event, ctx) => {
+    await restore(ctx as unknown as CtxLike);
   });
   pi.on("session_branch", async (_event, ctx) => {
-    restoreState(ctx as unknown as CtxLike);
-    await reconcile(ctx as unknown as CtxLike);
+    await restore(ctx as unknown as CtxLike);
   });
   pi.on("session_tree", async (_event, ctx) => {
-    restoreState(ctx as unknown as CtxLike);
-    await reconcile(ctx as unknown as CtxLike);
+    await restore(ctx as unknown as CtxLike);
   });
   pi.on("before_agent_start", async (_event, ctx) => {
-    await reconcile(ctx as unknown as CtxLike);
+    reconnectDropped(ctx as unknown as CtxLike);
+    await serialized(() => reconcile(ctx as unknown as CtxLike));
   });
 
   pi.registerCommand("mcps", {
     description: "Turn MCP servers on/off for this session only",
     handler: async (_args, commandCtx) => {
       const ctx = commandCtx as unknown as CtxLike;
+      // Rescan: a hand edit or `/mcp enable` may have changed what config disables.
+      configCache.delete(ctx.cwd);
       const config = readMcpConfig(ctx.cwd);
       const rows = buildRows(
         pi.getAllTools() as unknown as ToolInfoLike[],
         config,
         disabled,
+        connected,
         readServerErrors(),
       );
 
@@ -689,9 +999,10 @@ export default function mcps(pi: ExtensionAPI): void {
         return;
       }
 
+      const canConnect = mcpManager() !== undefined;
       const picked = await ctx.ui.custom<ModalResult | undefined>(
         (tui, theme, _keybindings, done) => {
-          const modal = new McpModal(rows, disabled, theme, done);
+          const modal = new McpModal(rows, disabled, canConnect, theme, done);
           tui.setFocus(modal); // overlay mode does not focus for you
           tui.requestRender();
           return modal;
@@ -703,9 +1014,37 @@ export default function mcps(pi: ExtensionAPI): void {
       );
       if (!picked) return;
 
-      const result = await apply(ctx, new Set(picked.disabled));
+      const off = new Set(picked.off);
+      const configOff = new Set(rows.filter(row => row.configOff).map(row => row.name));
+      const toDisconnect = rows.filter(row => row.configOff && row.state !== "config-off" && off.has(row.name));
+      const toConnect = rows.filter(row => row.state === "config-off" && !off.has(row.name)).map(row => row.name);
+
+      const gone = new Set<string>();
+      for (const row of toDisconnect) {
+        for (const tool of row.tools) gone.add(tool);
+        await disconnect(row.name);
+      }
+      if (toConnect.length > 0) ctx.ui.notify(`Connecting ${toConnect.join(", ")}…`, "info");
+      const failed = await connectNow(ctx.cwd, toConnect);
+      for (const name of toConnect) if (!failed.has(name)) connected.add(name);
+      // Adopt config-off servers left on that came up some other way (a manager retry after a timeout).
+      for (const row of rows) if (row.configOff && row.tools.length > 0 && !off.has(row.name)) connected.add(row.name);
+
+      // Config-off servers switch by connection, never through the switched-off set.
+      const nextDisabled = new Set([...off].filter(name => !configOff.has(name)));
+      const result = await serialized(() => apply(ctx, nextDisabled, gone));
       persist();
-      ctx.ui.notify(summarize(result), "info");
+
+      const groups = toolGroups(ctx);
+      const report: ApplyReport = {
+        ...result,
+        connected: toConnect
+          .filter(name => !failed.has(name))
+          .map((name): [string, number] => [name, groups.get(name)?.length ?? 0]),
+        disconnected: toDisconnect.map(row => row.name),
+        failed: [...failed],
+      };
+      ctx.ui.notify(summarize(report), report.failed.length > 0 ? "warning" : "info");
     },
   });
 }
